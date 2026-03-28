@@ -1,4 +1,6 @@
 import os
+import base64
+import tempfile
 import sys
 import json
 import time
@@ -14,7 +16,7 @@ from typing import List, Dict, Optional, Union, Any
 import nest_asyncio
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
+from mcp.types import ToolAnnotations, ImageContent, TextContent
 from pythonjsonlogger import jsonlogger
 from telethon import TelegramClient, functions, utils
 from telethon.sessions import StringSession
@@ -1701,6 +1703,157 @@ async def download_media(chat_id: Union[int, str], message_id: int, file_path: s
             message_id=message_id,
             file_path=file_path,
         )
+
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="View Image", openWorldHint=True, readOnlyHint=True)
+)
+@validate_id("chat_id")
+async def view_image(chat_id: Union[int, str], message_id: int) -> list:
+    """
+    Download and view an image from a Telegram message. Returns the image for Claude to see.
+    
+    Args:
+        chat_id: The chat ID or username.
+        message_id: The message ID containing the image.
+    
+    Returns:
+        Image content that Claude can view directly.
+    """
+    try:
+        entity = await client.get_entity(chat_id)
+        msg = await client.get_messages(entity, ids=message_id)
+        
+        if not msg:
+            return [TextContent(type="text", text="Error: Message not found")]
+        
+        if not msg.media:
+            return [TextContent(type="text", text=f"No media in this message. Text: {msg.text or 'empty'}")]
+        
+        # Check if it's a photo or image document
+        is_photo = hasattr(msg, 'photo') and msg.photo
+        is_image_doc = False
+        if hasattr(msg.media, 'document'):
+            mime = getattr(msg.media.document, 'mime_type', '')
+            is_image_doc = mime.startswith('image/')
+        
+        if not is_photo and not is_image_doc:
+            return [TextContent(type="text", text="Media is not an image")]
+        
+        # Download to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
+            tmp_path = tmp.name
+        
+        await client.download_media(msg, file=tmp_path)
+        
+        if not os.path.isfile(tmp_path):
+            return [TextContent(type="text", text="Failed to download image")]
+        
+        # Read and convert to base64
+        with open(tmp_path, 'rb') as f:
+            image_data = f.read()
+        
+        # Detect mime type
+        mime_type = mimetypes.guess_type(tmp_path)[0] or 'image/jpeg'
+        
+        # Convert to base64
+        base64_data = base64.b64encode(image_data).decode('utf-8')
+        
+        # Clean up temp file
+        os.unlink(tmp_path)
+        
+        # Build response with image and context
+        result = []
+        
+        # Add text context first
+        context_text = f"Image from message {message_id}"
+        if msg.text:
+            context_text += f"\nCaption: {msg.text}"
+        if msg.sender:
+            sender_name = getattr(msg.sender, 'first_name', '') or getattr(msg.sender, 'title', 'Unknown')
+            context_text += f"\nFrom: {sender_name}"
+        
+        result.append(TextContent(type="text", text=context_text))
+        
+        # Add the image
+        result.append(ImageContent(type="image", data=base64_data, mimeType=mime_type))
+        
+        return result
+        
+    except Exception as e:
+        logger.exception(f"view_image failed (chat_id={chat_id}, message_id={message_id})")
+        return [TextContent(type="text", text=f"Error: {str(e)}")]
+@mcp.tool(
+    annotations=ToolAnnotations(title="Send Image", openWorldHint=True, destructiveHint=True)
+)
+@validate_id("chat_id")
+async def send_image(chat_id: Union[int, str], image_source: str, caption: str = None) -> str:
+    """
+    Send an image to a Telegram chat. Supports URLs, file paths, or base64 data.
+    
+    Args:
+        chat_id: The chat ID or username to send the image to.
+        image_source: URL (http/https), file path, or base64 data URI (data:image/...;base64,...).
+        caption: Optional caption for the image.
+    
+    Returns:
+        Success or error message.
+    """
+    import urllib.request
+    
+    try:
+        entity = await client.get_entity(chat_id)
+        tmp_path = None
+        
+        # Handle different source types
+        if image_source.startswith('data:'):
+            # Base64 data URI
+            try:
+                header, b64data = image_source.split(',', 1)
+                image_bytes = base64.b64decode(b64data)
+                
+                # Extract extension from mime type
+                mime = header.split(':')[1].split(';')[0] if ':' in header else 'image/jpeg'
+                ext = mime.split('/')[-1] if '/' in mime else 'jpg'
+                
+                with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{ext}') as tmp:
+                    tmp.write(image_bytes)
+                    tmp_path = tmp.name
+            except Exception as e:
+                return f"Failed to decode base64 image: {e}"
+                
+        elif image_source.startswith('http://') or image_source.startswith('https://'):
+            # URL - download first
+            try:
+                ext = image_source.split('.')[-1].split('?')[0][:4] or 'jpg'
+                with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{ext}') as tmp:
+                    tmp_path = tmp.name
+                
+                req = urllib.request.Request(image_source, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    with open(tmp_path, 'wb') as f:
+                        f.write(response.read())
+            except Exception as e:
+                return f"Failed to download image from URL: {e}"
+        else:
+            # Assume it's a file path
+            if not os.path.isfile(image_source):
+                return f"File not found: {image_source}"
+            tmp_path = image_source
+        
+        # Send the image
+        await client.send_file(entity, tmp_path, caption=caption)
+        
+        # Clean up temp file (but not if it was the original file path)
+        if tmp_path != image_source and tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        
+        return f"Image sent to {chat_id}" + (f" with caption: {caption}" if caption else "")
+        
+    except Exception as e:
+        logger.exception(f"send_image failed (chat_id={chat_id})")
+        return f"Error sending image: {e}"
 
 
 @mcp.tool(
